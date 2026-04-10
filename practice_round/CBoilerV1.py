@@ -13,7 +13,7 @@ from datamodel import Listing, Observation, Order, OrderDepth, ProsperityEncoder
 class Logger:
     def __init__(self) -> None:
         self.logs = ""
-        self.max_log_length = 3750
+        self.max_log_length = 3720
 
     def print(self, *objects: Any, sep: str = " ", end: str = "\n") -> None:
         self.logs += sep.join(map(str, objects)) + end
@@ -130,7 +130,7 @@ class Trader:
     def __init__(self):
 
         self.limits = {
-            'TOMATOES' : 80,
+            'TOMATOES' : 20,
             'EMERALDS' : 80,
         }
 
@@ -188,13 +188,13 @@ class Trader:
                 pos = self.get_product_pos(state, product)                    
                 if int(ask) < acceptable_price or (abs(ask - acceptable_price) < 1 and (pos < 0 and abs(pos - amount) < abs(pos))):
                     if product == 'TOMATOES':
-                        size = min(50-self.tomato_position-self.tomato_buy_orders, -amount)
+                        size = min(20-self.tomato_position-self.tomato_buy_orders, -amount)
 
                         self.tomato_buy_orders += size 
                         self.send_buy_order(product, ask, size, msg=f"TRADE BUY {str(size)} x @ {ask}")
 
                     elif product == 'EMERALDS':
-                        size = min(50-self.emerald_position-self.emerald_buy_orders, -amount)
+                        size = min(20-self.emerald_position-self.emerald_buy_orders, -amount)
                         self.emerald_buy_orders += size 
                         self.send_buy_order(product, ask, size, msg=f"TRADE BUY {str(size)} x @ {ask}")
                     
@@ -208,12 +208,12 @@ class Trader:
                 pos = self.get_product_pos(state, product)   
                 if int(bid) > acceptable_price or (abs(bid-acceptable_price) < 1 and (pos > 0 and abs(pos - amount) < abs(pos))):
                     if product == 'TOMATOES':
-                        size = min(self.tomato_position + 50 - self.tomato_sell_orders, amount)
+                        size = min(self.tomato_position + 20 - self.tomato_sell_orders, amount)
                         self.tomato_sell_orders += size
                         self.send_sell_order(product, bid, -size, msg=f"TRADE SELL {str(-size)} x @ {bid}")
 
                     elif product == 'EMERALDS':
-                        size = min(self.emerald_position + 50 - self.emerald_sell_orders, amount)
+                        size = min(self.emerald_position + 20 - self.emerald_sell_orders, amount)
                         self.emerald_sell_orders += size
                         self.send_sell_order(product, bid, -size, msg=f"TRADE SELL {str(-size)} x @ {bid}")
                     
@@ -272,8 +272,8 @@ class Trader:
         best_bid =  self.get_bid(state, 'EMERALDS', 10000)
 
         # our ordinary market
-        buy_price = 9996
-        sell_price = 10004  
+        buy_price = 9995
+        sell_price = 10005  
 
         # update market if someone else is better than us
         if best_ask is not None and best_bid is not None:
@@ -283,16 +283,16 @@ class Trader:
             sell_price = ask - 1
             buy_price = bid + 1
     
-        max_buy =  50 - self.tomato_position - self.tomato_buy_orders 
-        max_sell = self.tomato_position + 50 - self.tomato_sell_orders
+        max_buy = 80 - self.emerald_position - self.emerald_buy_orders 
+        max_sell = self.emerald_position + 80 - self.emerald_sell_orders
 
         self.send_sell_order('EMERALDS', sell_price, -max_sell, msg=f"EMERALDS: MARKET MADE Sell {max_sell} @ {sell_price}")
         self.send_buy_order('EMERALDS', buy_price, max_buy, msg=f"EMERALDS: MARKET MADE Buy {max_buy} @ {buy_price}")
 
     def trade_tomato(self, state):
         # position limits
-        low = -50
-        high = 50
+        low = -20
+        high = 20
 
         position = state.position.get("TOMATOES", 0)
 
@@ -320,8 +320,8 @@ class Trader:
             best_bid =  self.get_bid(state, 'TOMATOES', fair_price)
 
             # our ordinary market
-            buy_price = math.floor(decimal_fair_price) - 2
-            sell_price = math.ceil(decimal_fair_price) + 2
+            buy_price = math.floor(decimal_fair_price) - 3
+            sell_price = math.ceil(decimal_fair_price) + 3
         
             # update market if someone else is better than us
             if best_ask is not None and best_bid is not None:
@@ -331,8 +331,8 @@ class Trader:
                 sell_price = ask - 1
                 buy_price = bid + 1
 
-            max_buy =  50 - self.emerald_position - self.emerald_buy_orders # MAXIMUM SIZE OF MARKET ON BUY SIDE
-            max_sell = self.emerald_position + 50 - self.emerald_sell_orders # MAXIMUM SIZE OF MARKET ON SELL SIDE
+            max_buy =  30 - self.emerald_position - self.emerald_buy_orders # MAXIMUM SIZE OF MARKET ON BUY SIDE
+            max_sell = self.emerald_position + 30 - self.emerald_sell_orders # MAXIMUM SIZE OF MARKET ON SELL SIDE
 
             self.send_buy_order('TOMATOES', buy_price, max_buy, msg=f"TOMATOES: MARKET MADE Buy {max_buy} @ {buy_price}")
             self.send_sell_order('TOMATOES', sell_price, -max_sell, msg=f"TOMATOES: MARKET MADE Sell {max_sell} @ {sell_price}")
@@ -340,8 +340,8 @@ class Trader:
     def make_squid_market(self, state, sell_side=True, buy_side=True, take_buys=True, take_sells=True):
         # this is the same logic as kelp!
         # position limits
-        low = -50
-        high = 50
+        low = -20
+        high = 20
 
         position = state.position.get("SQUID_INK", 0)
 
@@ -384,7 +384,7 @@ class Trader:
                 sell_price = ask - 1
                 buy_price = bid + 1
 
-            maximum_sizing = 50
+            maximum_sizing = 20
             max_buy =  maximum_sizing - state.position.get("SQUID_INK", 0) - self.squid_ink_buy_orders # MAXIMUM SIZE OF MARKET ON BUY SIDE
             max_sell = state.position.get("SQUID_INK", 0) + maximum_sizing - self.squid_ink_sell_orders # MAXIMUM SIZE OF MARKET ON SELL SIDE
 
