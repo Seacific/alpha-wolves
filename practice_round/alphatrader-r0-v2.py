@@ -130,7 +130,7 @@ class Trader:
     def __init__(self):
 
         self.limits = {
-            'TOMATOES' : 40,
+            'TOMATOES' : 80,
             'EMERALDS' : 80,
         }
 
@@ -262,6 +262,7 @@ class Trader:
             
         return None        
 
+
     def trade_emerald(self, state):
         # Buy anything at a good price
         self.search_buys(state, 'EMERALDS', 10000, depth=3)
@@ -272,8 +273,8 @@ class Trader:
         best_bid =  self.get_bid(state, 'EMERALDS', 10000)
 
         # our ordinary market
-        buy_price = 9995
-        sell_price = 10005  
+        buy_price = 9996
+        sell_price = 10004  
 
         # update market if someone else is better than us
         if best_ask is not None and best_bid is not None:
@@ -304,8 +305,8 @@ class Trader:
         buy_orders = order_book.buy_orders
 
         if len(sell_orders) != 0 and len(buy_orders) != 0:
-            ask, _ = list(sell_orders.items())[-1] # worst ask
-            bid, _ = list(buy_orders.items())[-1]  # worst bid
+            ask, _ = list(sell_orders.items())[1] # worst ask
+            bid, _ = list(buy_orders.items())[1]  # worst bid
             
             fair_price = int(math.ceil((ask + bid) / 2))  # try changing this to floor maybe
 
@@ -319,11 +320,12 @@ class Trader:
             best_ask = self.get_ask(state, 'TOMATOES', fair_price)
             best_bid =  self.get_bid(state, 'TOMATOES', fair_price)
 
-            # our ordinary market
+            ## our ordinary market
             buy_price = math.floor(decimal_fair_price) - 3
             sell_price = math.ceil(decimal_fair_price) + 3
+  
         
-            # update market if someone else is better than us
+            ## update market if someone else is better than us
             if best_ask is not None and best_bid is not None:
                 ask = best_ask
                 bid = best_bid
@@ -342,6 +344,8 @@ class Trader:
             # if we are in short, and our best sell price IS the fair price, don't sell more
             if not(pos < 0 and float(sell_price) == decimal_fair_price):
                 self.send_sell_order('TOMATOES', sell_price, -max_sell, msg=f"TOMATOES: MARKET MADE Sell {max_sell} @ {sell_price}")
+
+
 
     # TODO: UPDATE WHENEVER YOU ADD A NEW PRODUCT
     def reset_orders(self, state):
