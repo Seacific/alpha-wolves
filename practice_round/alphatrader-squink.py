@@ -142,6 +142,20 @@ class Trader:
         self.tomato_buy_orders = 0
         self.tomato_sell_orders = 0
         self.tomato_position = 0
+        # tomato market-making / trend windows
+        self.tomato_long_window_prices = []
+        self.tomato_short_window_prices = []
+        self.tomato_long_window = 30
+        self.tomato_short_window = 5
+        self.volatility_window_price_diffs = []
+        self.volatility_window = 10
+        self.prev_price = None
+        self.prev_vol = None
+        # track last logged trade timestamp per symbol to avoid duplicates
+        self.last_logged_trade_timestamp = {}
+        # accumulate tomato trades for end-of-day CSV export
+        self.tomato_trade_records = []  # list of (timestamp, price, quantity, buyer, seller)
+        self.last_seen_timestamp = -1
 
         # Kelp
         self.emerald_position = 0
@@ -291,9 +305,150 @@ class Trader:
         self.send_buy_order('EMERALDS', buy_price, max_buy, msg=f"EMERALDS: MARKET MADE Buy {max_buy} @ {buy_price}")
 
     def trade_tomato(self, state):
-        # position limits
-        low = -self.limits["TOMATOES"]
-        high = self.limits["TOMATOES"] 
+        # log recent market trades for TOMATOES
+        self.log_trades(state, 'TOMATOES')
+        # adapted squid-style tomato trading
+        order_book = state.order_depths['TOMATOES']
+        sell_orders = order_book.sell_orders
+        buy_orders = order_book.buy_orders
+
+        if len(sell_orders) != 0 and len(buy_orders) != 0:
+            # use largest-volume walls when available
+            try:
+                bid_wall_price, bid_wall_amount = max(buy_orders.items(), key=lambda x: x[1])
+            except ValueError:
+                bid_wall_price, bid_wall_amount = None, 0
+
+            try:
+                ask_wall_price, ask_wall_amount = max(sell_orders.items(), key=lambda x: abs(x[1]))
+            except ValueError:
+                ask_wall_price, ask_wall_amount = None, 0
+
+            # fallback to worst levels if walls absent
+            if bid_wall_price is None:
+                bids_list = list(buy_orders.items())
+                bid_wall_price = bids_list[-1][0]
+            if ask_wall_price is None:
+                asks_list = list(sell_orders.items())
+                ask_wall_price = asks_list[-1][0]
+
+            decimal_fair_price = (bid_wall_price + ask_wall_price) / 2
+
+            # Append to windows
+            self.tomato_long_window_prices.append(decimal_fair_price)
+            self.tomato_long_window_prices = self.tomato_long_window_prices[-self.tomato_long_window:]
+            self.tomato_short_window_prices.append(decimal_fair_price)
+            self.tomato_short_window_prices = self.tomato_short_window_prices[-self.tomato_short_window:]
+
+            if self.prev_price is not None:
+                price_diff = decimal_fair_price - self.prev_price
+                self.volatility_window_price_diffs.append(price_diff)
+                self.volatility_window_price_diffs = self.volatility_window_price_diffs[-self.volatility_window:]
+
+            sell_side = True
+            buy_side = True
+
+            # check volatility levels
+            volatility = 0
+            if len(self.volatility_window_price_diffs) == self.volatility_window:
+                volatility = np.std(self.volatility_window_price_diffs)
+                logger.print("TOMATOES: VOLATILITY: " + str(volatility))
+
+            # check if we have enough data
+            if len(self.tomato_long_window_prices) == self.tomato_long_window:
+                logger.print("TOMATOES: VOLATILITY THRESHOLD REACHED, TURNING OFF MARKET MAKING")
+                short_mean = np.mean(self.tomato_short_window_prices)
+                long_mean = np.mean(self.tomato_long_window_prices)
+
+                if long_mean < short_mean:
+                    # market is up trending
+                    buy_side = False
+                    logger.print("TOMATOES: UP TRENDING, BUY SIDE OFF")
+
+                elif long_mean > short_mean:
+                    # market is down trending
+                    sell_side = False
+                    logger.print("TOMATOES: DOWN TRENDING, SELL SIDE OFF")
+
+                size = self.get_product_pos(state, 'TOMATOES')
+
+                tomato_pos_size = abs(size/self.limits['TOMATOES'])
+
+                if tomato_pos_size > 0.8:
+                    # near our position limit, enable both sides
+                    buy_side = True
+                    sell_side = True
+                    logger.print("TOMATOES: NEAR POSITION LIMIT, BOTH SIDES ON")
+
+                # flash crash check
+                if self.prev_vol is not None:
+                    delta_vol = abs(volatility - self.prev_vol)
+                    self.prev_vol = volatility
+                    logger.print("TOMATOES: delta volatility: " + str(delta_vol))
+                    if delta_vol > 2:
+                        logger.print("TOMATOES: HUGE VOLATILITY MOVE, FULL SEND OTHER DIRECTION")
+
+                        if self.prev_price > decimal_fair_price:
+                            # price moved UP, SELL SELL SELL
+                            self.search_buys(state, 'TOMATOES', decimal_fair_price+4, depth=3)
+                        elif self.prev_price < decimal_fair_price:
+                            # price moved down BUY BUY BUY
+                            self.search_sells(state, 'TOMATOES', decimal_fair_price-4, depth=3)
+                else:
+                    self.prev_vol = volatility
+
+            logger.print(f"TOMATOES FAIR PRICE (walls): {decimal_fair_price} -- bid_wall={bid_wall_price}@{bid_wall_amount} ask_wall={ask_wall_price}@{ask_wall_amount}")
+            # make market according to squid-style logic
+            self.make_tomato_market(state, sell_side=sell_side, buy_side=buy_side, max_pos_percent=1)
+            self.prev_price = decimal_fair_price
+
+    def log_trades(self, state: TradingState, symbol: str) -> None:
+        """Append new market trades for `symbol` to logs/<symbol>_trades.csv (timestamp,price,quantity,buyer,seller).
+        Uses self.last_logged_trade_timestamp to avoid re-logging trades already written.
+        """
+        trades = state.market_trades.get(symbol)
+        if not trades:
+            return
+
+        last_ts = self.last_logged_trade_timestamp.get(symbol, -1)
+        new_trades = [t for t in trades if t.timestamp > last_ts]
+        if not new_trades:
+            return
+        # Use the in-memory logger rather than writing files
+        for t in new_trades:
+            logger.print(f"TRADE_LOG,{symbol},{t.timestamp},{t.price},{t.quantity},{t.buyer},{t.seller}")
+            # accumulate for end-of-day CSV
+            if symbol == 'TOMATOES':
+                self.tomato_trade_records.append((t.timestamp, t.price, t.quantity, t.buyer, t.seller))
+            if t.timestamp > last_ts:
+                last_ts = t.timestamp
+
+        self.last_logged_trade_timestamp[symbol] = last_ts
+        logger.print(f"Logged {len(new_trades)} {symbol} trades (in-stream)")
+
+    def emit_daily_tomato_csv(self) -> None:
+        """Emit accumulated TOMATOES trades as a single CSV via logger.print and then clear the buffer."""
+        if not self.tomato_trade_records:
+            logger.print("DAILY_TOMATO_CSV: no records to emit")
+            return
+
+        header = 'timestamp,price,quantity,buyer,seller'
+        lines = [header]
+        for rec in self.tomato_trade_records:
+            ts, price, qty, buyer, seller = rec
+            lines.append(f"{ts},{price},{qty},{buyer},{seller}")
+
+        csv_text = "\n".join(lines)
+        logger.print("DAILY_TOMATO_CSV_START")
+        logger.print(csv_text)
+        logger.print("DAILY_TOMATO_CSV_END")
+        # clear records after emitting
+        self.tomato_trade_records = []
+
+    def make_tomato_market(self, state, sell_side=True, buy_side=True, take_buys=True, take_sells=True, max_pos_percent=1):
+        # mirrored from squid-market logic adapted to TOMATOES
+        low = -self.limits['TOMATOES']
+        high = self.limits['TOMATOES']
 
         position = state.position.get("TOMATOES", 0)
 
@@ -305,61 +460,61 @@ class Trader:
         buy_orders = order_book.buy_orders
 
         if len(sell_orders) != 0 and len(buy_orders) != 0:
-            # find the largest volume (wall) on each side and use those prices
+            # prefer wall-based fair price
             try:
                 bid_wall_price, bid_wall_amount = max(buy_orders.items(), key=lambda x: x[1])
             except ValueError:
                 bid_wall_price, bid_wall_amount = None, 0
 
             try:
-                # sell orders may be negative sizes depending on feed, use absolute
                 ask_wall_price, ask_wall_amount = max(sell_orders.items(), key=lambda x: abs(x[1]))
             except ValueError:
                 ask_wall_price, ask_wall_amount = None, 0
 
-            # fallback to best levels if walls are not present
             if bid_wall_price is None:
                 bids_list = list(buy_orders.items())
-                bid_wall_price = bids_list[0][0]
+                bid_wall_price = bids_list[-1][0]
             if ask_wall_price is None:
                 asks_list = list(sell_orders.items())
-                ask_wall_price = asks_list[0][0]
+                ask_wall_price = asks_list[-1][0]
 
             fair_price = int(math.ceil((bid_wall_price + ask_wall_price) / 2))
             decimal_fair_price = (bid_wall_price + ask_wall_price) / 2
 
             logger.print(f"TOMATOES FAIR PRICE (walls): {decimal_fair_price} -- bid_wall={bid_wall_price}@{bid_wall_amount} ask_wall={ask_wall_price}@{ask_wall_amount}")
-            # use wall-based fair price for search
-            self.search_buys(state, 'TOMATOES', decimal_fair_price, depth=3)
-            self.search_sells(state, 'TOMATOES', decimal_fair_price, depth=3)
+            if buy_side:
+                self.search_buys(state, 'TOMATOES', decimal_fair_price, depth=3)
+            if sell_side:
+                self.search_sells(state, 'TOMATOES', decimal_fair_price, depth=3)
 
-            # Check if there's another market maker
             best_ask = self.get_ask(state, 'TOMATOES', fair_price)
-            best_bid =  self.get_bid(state, 'TOMATOES', fair_price)
+            best_bid = self.get_bid(state, 'TOMATOES', fair_price)
 
-            ## our ordinary market
             buy_price = math.floor(decimal_fair_price) - 3
             sell_price = math.ceil(decimal_fair_price) + 3
-  
-        
-            ## update market if someone else is better than us
+
             if best_ask is not None and best_bid is not None:
                 ask = best_ask
                 bid = best_bid
-                
-                sell_price = ask - 1
-                buy_price = bid + 1
+                if ask - 1 > decimal_fair_price:
+                    sell_price = ask - 1
+                if bid + 1 < decimal_fair_price:
+                    buy_price = bid + 1
 
-            max_buy =  self.limits["TOMATOES"] - self.tomato_position - self.tomato_buy_orders # MAXIMUM SIZE OF MARKET ON BUY SIDE
-            max_sell = self.tomato_position + self.limits["TOMATOES"] - self.tomato_sell_orders # MAXIMUM SIZE OF MARKET ON SELL SIDE
+            maximum_sizing = self.limits['TOMATOES']
+            max_buy = maximum_sizing - state.position.get("TOMATOES", 0) - self.tomato_buy_orders
+            max_sell = state.position.get("TOMATOES", 0) + maximum_sizing - self.tomato_sell_orders
 
-            pos = self.get_product_pos(state, 'TOMATOES')
-            # if we are in long, and our best buy price IS the fair price, don't buy more 
-            if not(pos > 0 and float(buy_price) == decimal_fair_price):
+            max_buy = max(0, max_buy)
+            max_sell = max(0, max_sell)
+
+            max_pos = self.limits['TOMATOES'] * max_pos_percent
+            max_buy = min(max_buy, max_pos)
+            max_sell = min(max_sell, max_pos)
+
+            if buy_side:
                 self.send_buy_order('TOMATOES', buy_price, max_buy, msg=f"TOMATOES: MARKET MADE Buy {max_buy} @ {buy_price}")
-            
-            # if we are in short, and our best sell price IS the fair price, don't sell more
-            if not(pos < 0 and float(sell_price) == decimal_fair_price):
+            if sell_side:
                 self.send_sell_order('TOMATOES', sell_price, -max_sell, msg=f"TOMATOES: MARKET MADE Sell {max_sell} @ {sell_price}")
 
 
@@ -382,6 +537,13 @@ class Trader:
             self.orders[product] = []
 
     def run(self, state: TradingState):        
+        # detect day rollover by timestamp decreasing -> emit end-of-day CSV
+        if self.last_seen_timestamp != -1 and state.timestamp < self.last_seen_timestamp:
+            # end of previous day
+            self.emit_daily_tomato_csv()
+
+        self.last_seen_timestamp = state.timestamp
+
         self.reset_orders(state)
 
         self.trade_tomato(state)
