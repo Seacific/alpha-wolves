@@ -1,0 +1,96 @@
+Under price-time priority:
+
+A buy order at price p sits behind all older bids at prices > p and at price p.
+
+A sell order at price p sits behind all older asks at prices < p and at price p.
+
+So the executable quantity formulas are:
+
+X buy = (p,q)=max(0,min{q, A(≤p)−B(>p)−B(=p)})
+
+X sell = (p,q)=max(0,min{q, B(≥p)−A(<p)−A(=p)})
+
+where A is ask depth and B is bid depth from the order book.
+
+Profit functions:
+
+Π buy (p,q) = x buy(p,q) ⋅ (V − fb − fs − p)
+
+Π sell(p,q) = x sell(p,q) ⋅ (p − fb − fs − V)
+
+Dryland Flax:
+
+For Dryland Flax, the panel says any acquired flax is sold after the auction for 30 XIRECs per piece, and no explicit trading fee is stated in that section.
+The displayed bids are 30k at 30, 5k at 29, 12k at 28, and 28k at 27; the asks are 40k at 28, 20k at 31, 20k at 32, and 30k at 33.
+
+The best buy under queue priority is at 29, because at 28 the 30k at 30, 5k at 29, and 12k at 28 already absorb the 40k ask at 28 before you get hit.
+
+At 29, residual accessible ask volume is 40k − 30k − 5k = 5k, so we can buy up to 5k units with unit profit 30 − 29 = 1, for a total profit of 5k.
+
+Ember Mushroom:
+
+For Ember Mushroom, the panel says any acquired mushroom is sold after the auction for 20 XIRECs, and fees are 0.05 XIRECs per unit on buy plus 0.05 on sell, so total round-trip fee is 0.10.
+
+p=12: 
+A(≤12) = 20k, B(>12)=43+17+6+5+10+5+10=96k, so fill is 0.
+
+p=13: 
+A(≤13)=45k, B(>13)=96k, B(=13)=7k, so fill is 0.
+
+p=14: 
+A(≤14)=80k, B(>14)=43+17+6+5+10+5=86k, so fill is 0.
+
+p=15: 
+A(≤15)=86k, B(>15)=43+17+6+5+10=81k, B(=15)=5k, so fill is 0.
+
+p=16: 
+A(≤16)=91k, B(>16)=43+17+6+5=71k, B(=16)=10k, so residual is 10k, hence executable size is up to 10k.
+
+p=17: 
+A(≤17)=91k, B(>17)=43+17+6=66k, B(=17)=5k, so residual is 20k
+
+p=18: 
+A(≤18)=101k, B(>18)=43+17=60k, B(=18)=6k, so residual is 35k. 
+
+p=19: 
+A(≤19)=113k, B(>19)=43k, B(=19)=17k, so residual is 53k.
+
+Calculating profit:
+
+p=16: 10k × 3.9 = 39k
+
+p=17: 20k × 2.9 = 58k
+
+p=18: 35k × 1.9 = 66.5k
+
+p=19: 53k × 0.9 = 47.7k.
+
+So the optimal price-time-priority solution for mushrooms is
+
+p = 18, q = 35,000 with profit:
+
+Π = 35,000(19.9 - 18) = 66,500.
+
+Optimized strategy:
+
+Dryland Flax: bid 29 for at least 5k, expecting only 5k executable quantity.
+
+Ember Mushroom: bid 18 for at least 35k, expecting 35k executable quantity.
+
+That gives total optimized profit:
+
+Π = 5,000 + 66,500 = 71,500.
+
+I checked the sell-side case for both commodities, and it was either 0 EV or negative.
+
+
+
+
+
+
+
+
+
+
+
+
