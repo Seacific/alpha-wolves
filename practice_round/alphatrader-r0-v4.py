@@ -1,10 +1,19 @@
 from typing import List, Any
+from typing import List, Any
 import json
 import math
 from datamodel import Listing, Observation, Order, OrderDepth, ProsperityEncoder, Symbol, Trade, TradingState
 
 # ─── Mean-reversion parameters for TOMATOES ───────────────────────────────────
 MR_WINDOW       = 500    # rolling price history window
+MR_ENTRY_Z      = 1.5   # z-score to enter a directional position
+MR_EXIT_Z       = 0.4   # z-score to consider ourselves "back at mean"
+MR_STOP_Z       = 3.5   # stop-loss: z-score too far against us → close
+MR_Z_SCALE      = 1.5   # how much to adjust acceptable price per unit of z
+# ──────────────────────────────────────────────────────────────────────────────
+
+# ─── Mean-reversion parameters for TOMATOES ───────────────────────────────────
+MR_WINDOW       = 40    # rolling price history window
 MR_ENTRY_Z      = 1.5   # z-score to enter a directional position
 MR_EXIT_Z       = 0.4   # z-score to consider ourselves "back at mean"
 MR_STOP_Z       = 3.5   # stop-loss: z-score too far against us → close
@@ -389,18 +398,87 @@ class Trader:
             max_buy =  self.limits["TOMATOES"] - self.tomato_position - self.tomato_buy_orders # MAXIMUM SIZE OF MARKET ON BUY SIDE
             max_sell = self.tomato_position + self.limits["TOMATOES"] - self.tomato_sell_orders # MAXIMUM SIZE OF MARKET ON SELL SIDE
 
-            pos = self.get_product_pos(state, 'TOMATOES')
+        pos = self.get_product_pos(state, 'TOMATOES')
+        logger.print(f"TOMATOES: mid={mid_price:.1f} fair={decimal_fair:.1f} "
+                     f"z={z_score:.3f} pos={pos} hist={len(self.tomato_price_history)}")
 
+        # ── Z-score-adjusted acceptable prices ────────────────────────────────
+        # When z < 0 (price low vs mean): raise buy threshold → take cheaper asks
+        # When z > 0 (price high vs mean): lower sell threshold → take richer bids
+        # Formula: acceptable = fair - z * scale
+        #   z negative → acceptable rises  → more willing to buy
+        #   z positive → acceptable falls  → more willing to sell
+        z_adjusted = decimal_fair - z_score * MR_Z_SCALE
 
-            
-            # if we are in long, and our best buy price IS the fair price, don't buy more 
-            if not(pos > 0 and float(buy_price) == decimal_fair_price):
-                self.send_buy_order('TOMATOES', buy_price, max_buy, msg=f"TOMATOES: MARKET MADE Buy {max_buy} @ {buy_price}")
-            
-            # if we are in short, and our best sell price IS the fair price, don't sell more
-            if not(pos < 0 and float(sell_price) == decimal_fair_price):
-                self.send_sell_order('TOMATOES', sell_price, -max_sell, msg=f"TOMATOES: MARKET MADE Sell {max_sell} @ {sell_price}")
+        # ── Regime decisions ──────────────────────────────────────────────────
 
+        if abs(z_score) > MR_STOP_Z:
+            # Stop-loss: price moved very far; close position at market
+            if pos > 0:
+                self.search_sells(state, 'TOMATOES', decimal_fair - MR_STOP_Z * 2, depth=5)
+                logger.print(f"TOMATOES STOP-LOSS: closing long (z={z_score:.2f})")
+            elif pos < 0:
+                self.search_buys(state, 'TOMATOES', decimal_fair + MR_STOP_Z * 2, depth=5)
+                logger.print(f"TOMATOES STOP-LOSS: closing short (z={z_score:.2f})")
+
+        elif z_score < -MR_ENTRY_Z:
+            # Price below rolling mean → expect reversion upward → BUY
+            self.search_buys(state, 'TOMATOES', z_adjusted, depth=5)
+            logger.print(f"TOMATOES LONG ENTRY (z={z_score:.2f})")
+
+        elif z_score > MR_ENTRY_Z:
+            # Price above rolling mean → expect reversion downward → SELL
+            self.search_sells(state, 'TOMATOES', z_adjusted, depth=5)
+            logger.print(f"TOMATOES SHORT ENTRY (z={z_score:.2f})")
+
+        elif abs(z_score) < MR_EXIT_Z and pos != 0:
+            # Back at mean: unwind at fair price
+            if pos > 0:
+                self.search_sells(state, 'TOMATOES', decimal_fair, depth=3)
+                logger.print(f"TOMATOES EXIT long (z={z_score:.2f})")
+            else:
+                self.search_buys(state, 'TOMATOES', decimal_fair, depth=3)
+                logger.print(f"TOMATOES EXIT short (z={z_score:.2f})")
+
+        else:
+            # Normal regime: market-take at wall-based fair price
+            self.search_buys(state, 'TOMATOES', decimal_fair, depth=3)
+            self.search_sells(state, 'TOMATOES', decimal_fair, depth=3)
+
+        # ── Market-making quotes, skewed toward the reversion ─────────────────
+        BASE_SPREAD = 3
+
+        if z_score < -MR_ENTRY_Z:
+            # Lean on the buy side
+            buy_price  = math.floor(decimal_fair) - 1
+            sell_price = math.ceil(decimal_fair)  + BASE_SPREAD + 2
+        elif z_score > MR_ENTRY_Z:
+            # Lean on the sell side
+            buy_price  = math.floor(decimal_fair) - BASE_SPREAD - 2
+            sell_price = math.ceil(decimal_fair)  + 1
+        else:
+            buy_price  = math.floor(decimal_fair) - BASE_SPREAD
+            sell_price = math.ceil(decimal_fair)  + BASE_SPREAD
+
+        # Tighten if competitors are inside our spread
+        competing_ask = self.get_ask(state, 'TOMATOES', fair_price)
+        competing_bid = self.get_bid(state, 'TOMATOES', fair_price)
+
+        if competing_ask is not None:
+            sell_price = min(sell_price, competing_ask - 1)
+        if competing_bid is not None:
+            buy_price  = max(buy_price,  competing_bid + 1)
+
+        max_buy  = self.limits["TOMATOES"] - self.tomato_position - self.tomato_buy_orders
+        max_sell = self.tomato_position + self.limits["TOMATOES"] - self.tomato_sell_orders
+
+        if max_buy > 0 and not (pos > 0 and float(buy_price) == decimal_fair):
+            self.send_buy_order('TOMATOES', buy_price, max_buy,
+                                msg=f"TOMATOES MM Buy {max_buy} @ {buy_price}")
+
+        if max_sell > 0 and not (pos < 0 and float(sell_price) == decimal_fair):
+            self.send_sell_order('TOMATOES', sell_price, -max_sell,
+                                 msg=f"TOMATOES MM Sell {max_sell} @ {sell_price}")
 
     # ── Bookkeeping ────────────────────────────────────────────────────────────
 
