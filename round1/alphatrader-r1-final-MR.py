@@ -404,91 +404,241 @@ class Trader:
         #if max_sell > 0:
         #    self.send_sell_order('INTARIAN_PEPPER_ROOT', sell_price, -max_sell, msg=f"INTARIAN_PEPPER_ROOT: MARKET MADE Sell {max_sell} @ {sell_price} (pred={predicted:.3f})")
 
-    def trade_osmium(self, state):
-        # ash_coated_osmium market-making (previously trade_tomato)
-        # position limits
-        low = -self.limits["ASH_COATED_OSMIUM"]
-        high = self.limits["ASH_COATED_OSMIUM"] 
+    def _osmium_fair(self, buy_orders, sell_orders):
+        """Wall-based fair price for osmium. Updates prev wall state."""
+        bid_wall_price = None
+        ask_wall_price = None
+        if buy_orders:
+            try:
+                bid_wall_price = max(buy_orders.items(), key=lambda x: x[1])[0]
+            except Exception:
+                pass
+        if sell_orders:
+            try:
+                ask_wall_price = max(sell_orders.items(), key=lambda x: abs(x[1]))[0]
+            except Exception:
+                pass
+        if bid_wall_price is None:
+            bid_wall_price = self.osmium_prev_bid_wall
+        if ask_wall_price is None:
+            ask_wall_price = self.osmium_prev_ask_wall
+        if bid_wall_price is not None:
+            self.osmium_prev_bid_wall = bid_wall_price
+        if ask_wall_price is not None:
+            self.osmium_prev_ask_wall = ask_wall_price
+        if bid_wall_price is None or ask_wall_price is None:
+            return None
+        return (bid_wall_price + ask_wall_price) / 2.0
 
-        position = state.position.get("ASH_COATED_OSMIUM", 0)
-
-        max_buy = high - position
-        max_sell = position - low
-
-        order_book = state.order_depths.get('ASH_COATED_OSMIUM')
-        if order_book is None:
+    def _osmium_passive_buy_to(self, buy_orders, sell_orders, pos, target, fair, edge=3, max_clip=20):
+        """Move toward a long target without paying the spread."""
+        limit = self.limits['ASH_COATED_OSMIUM']
+        to_buy = min(target - pos - self.osmium_buy_orders,
+                     limit - pos - self.osmium_buy_orders,
+                     max_clip)
+        if to_buy <= 0:
             return
-        sell_orders = order_book.sell_orders
-        buy_orders = order_book.buy_orders
+
+        best_bid = max(buy_orders.keys()) if buy_orders else None
+        best_ask = min(sell_orders.keys()) if sell_orders else None
+
+        px = math.floor(fair) - edge
+        if best_bid is not None:
+            px = min(best_bid + 1, px)
+        if best_ask is not None:
+            px = min(px, best_ask - 1)
+
+        self.osmium_buy_orders += to_buy
+        self.send_buy_order('ASH_COATED_OSMIUM', px, to_buy,
+            msg=f"OSMIUM MR PASSIVE BUY {to_buy}@{px} target={target}")
+
+    def _osmium_passive_sell_to(self, buy_orders, sell_orders, pos, target, fair, edge=3, max_clip=20):
+        """Move toward a short target without paying the spread."""
+        limit = self.limits['ASH_COATED_OSMIUM']
+        to_sell = min(pos - target - self.osmium_sell_orders,
+                      pos + limit - self.osmium_sell_orders,
+                      max_clip)
+        if to_sell <= 0:
+            return
+
+        best_bid = max(buy_orders.keys()) if buy_orders else None
+        best_ask = min(sell_orders.keys()) if sell_orders else None
+
+        px = math.ceil(fair) + edge
+        if best_ask is not None:
+            px = max(best_ask - 1, px)
+        if best_bid is not None:
+            px = max(px, best_bid + 1)
+
+        self.osmium_sell_orders += to_sell
+        self.send_sell_order('ASH_COATED_OSMIUM', px, -to_sell,
+            msg=f"OSMIUM MR PASSIVE SELL {to_sell}@{px} target={target}")
+
+    def _osmium_take_buy_to(self, sell_orders, pos, target, acceptable_price, max_clip=16):
+        """Cross only asks that are still cheap versus the reversion anchor."""
+        limit = self.limits['ASH_COATED_OSMIUM']
+        to_buy = min(target - pos - self.osmium_buy_orders,
+                     limit - pos - self.osmium_buy_orders,
+                     max_clip)
+        if to_buy <= 0:
+            return
+
+        for ask in sorted(sell_orders.keys()):
+            if to_buy <= 0 or ask > acceptable_price:
+                break
+            size = min(to_buy, -sell_orders[ask])
+            if size <= 0:
+                continue
+            self.osmium_buy_orders += size
+            self.send_buy_order('ASH_COATED_OSMIUM', ask, size,
+                msg=f"OSMIUM MR TAKE BUY {size}@{ask} acceptable={acceptable_price}")
+            to_buy -= size
+
+    def _osmium_take_sell_to(self, buy_orders, pos, target, acceptable_price, max_clip=16):
+        """Cross only bids that are still rich versus the reversion anchor."""
+        limit = self.limits['ASH_COATED_OSMIUM']
+        to_sell = min(pos - target - self.osmium_sell_orders,
+                      pos + limit - self.osmium_sell_orders,
+                      max_clip)
+        if to_sell <= 0:
+            return
+
+        for bid in sorted(buy_orders.keys(), reverse=True):
+            if to_sell <= 0 or bid < acceptable_price:
+                break
+            size = min(to_sell, buy_orders[bid])
+            if size <= 0:
+                continue
+            self.osmium_sell_orders += size
+            self.send_sell_order('ASH_COATED_OSMIUM', bid, -size,
+                msg=f"OSMIUM MR TAKE SELL {size}@{bid} acceptable={acceptable_price}")
+            to_sell -= size
+
+    def _osmium_market_make(self, buy_orders, sell_orders, pos, fair,
+                            buy_side=True, sell_side=True, quote_size=None):
+        """Market-make osmium using the review strategy: take imbalanced quotes then post around fair."""
+        limit = self.limits['ASH_COATED_OSMIUM']
         no_bids = len(buy_orders) == 0
         no_asks = len(sell_orders) == 0
 
-        # compute wall prices where available
-        bid_wall_price, bid_wall_amount = None, 0
-        ask_wall_price, ask_wall_amount = None, 0
+        # Take any asks below fair (search_buys equivalent)
+        if buy_side:
+            for ask_px in sorted(sell_orders.keys()):
+                if ask_px >= fair:
+                    break
+                avail = limit - pos - self.osmium_buy_orders
+                size = min(avail, -sell_orders[ask_px])
+                if size <= 0:
+                    continue
+                self.osmium_buy_orders += size
+                self.send_buy_order('ASH_COATED_OSMIUM', ask_px, size,
+                    msg=f"OSMIUM MM TAKE BUY {size}@{ask_px}")
 
-        if len(buy_orders) != 0:
-            try:
-                bid_wall_price, bid_wall_amount = max(buy_orders.items(), key=lambda x: x[1])
-            except Exception:
-                bid_wall_price, bid_wall_amount = None, 0
+        # Take any bids above fair (search_sells equivalent)
+        if sell_side:
+            for bid_px in sorted(buy_orders.keys(), reverse=True):
+                if bid_px <= fair:
+                    break
+                avail = pos + limit - self.osmium_sell_orders
+                size = min(avail, buy_orders[bid_px])
+                if size <= 0:
+                    continue
+                self.osmium_sell_orders += size
+                self.send_sell_order('ASH_COATED_OSMIUM', bid_px, -size,
+                    msg=f"OSMIUM MM TAKE SELL {size}@{bid_px}")
 
-        if len(sell_orders) != 0:
-            try:
-                ask_wall_price, ask_wall_amount = max(sell_orders.items(), key=lambda x: abs(x[1]))
-            except Exception:
-                ask_wall_price, ask_wall_amount = None, 0
+        # Find best quotes from other makers (outside our fair)
+        best_ask_out = None
+        for px in sorted(sell_orders.keys()):
+            if px > math.ceil(fair):
+                best_ask_out = px; break
+        best_bid_out = None
+        for px in sorted(buy_orders.keys(), reverse=True):
+            if px < math.floor(fair):
+                best_bid_out = px; break
 
-        # fall back to the last-seen wall on whichever side is missing
-        if bid_wall_price is None:
-            if self.osmium_prev_bid_wall is None:
-                return
-            bid_wall_price = self.osmium_prev_bid_wall
-            bid_wall_amount = 0
-        if ask_wall_price is None:
-            if self.osmium_prev_ask_wall is None:
-                return
-            ask_wall_price = self.osmium_prev_ask_wall
-            ask_wall_amount = 0
+        # Adaptive spread: wider when no competition, tighter when another maker present
+        buy_spread  = 10 if no_bids else 6
+        sell_spread = 10 if no_asks else 6
+        buy_px  = math.floor(fair) - buy_spread
+        sell_px = math.ceil(fair)  + sell_spread
 
-        # compute fair price and remember walls for next time
-        decimal_fair_price = (bid_wall_price + ask_wall_price) / 2
-        fair_price = int(math.ceil(decimal_fair_price))
-        self.osmium_prev_bid_wall = bid_wall_price
-        self.osmium_prev_ask_wall = ask_wall_price
+        # Step one tick in front of the best outside quote
+        if best_ask_out is not None:
+            sell_px = best_ask_out - 1
+        if best_bid_out is not None:
+            buy_px  = best_bid_out + 1
 
-        logger.print(f"ASH_COATED_OSMIUM FAIR PRICE (walls): {decimal_fair_price} -- bid_wall={bid_wall_price}@{bid_wall_amount} ask_wall={ask_wall_price}@{ask_wall_amount}")
-        # use wall-based fair price for search
-        self.search_buys(state, 'ASH_COATED_OSMIUM', decimal_fair_price, depth=3)
-        self.search_sells(state, 'ASH_COATED_OSMIUM', decimal_fair_price, depth=3)
+        max_buy  = limit - pos - self.osmium_buy_orders
+        max_sell = pos + limit - self.osmium_sell_orders
+        if quote_size is not None:
+            max_buy  = min(max_buy,  quote_size)
+            max_sell = min(max_sell, quote_size)
 
-        # Check if there's another market maker
-        best_ask = self.get_ask(state, 'ASH_COATED_OSMIUM', fair_price)
-        best_bid =  self.get_bid(state, 'ASH_COATED_OSMIUM', fair_price)
+        # Guard: don't deepen an existing position right at fair
+        if buy_side and max_buy > 0:
+            if not (pos > 0 and float(buy_px) == fair):
+                self.osmium_buy_orders += max_buy
+                self.send_buy_order('ASH_COATED_OSMIUM', buy_px, max_buy,
+                    msg=f"OSMIUM MM BID {max_buy}@{buy_px}")
+        if sell_side and max_sell > 0:
+            if not (pos < 0 and float(sell_px) == fair):
+                self.osmium_sell_orders += max_sell
+                self.send_sell_order('ASH_COATED_OSMIUM', sell_px, -max_sell,
+                    msg=f"OSMIUM MM ASK {max_sell}@{sell_px}")
 
-        ## our ordinary market — widen when that side has no competition
-        buy_spread = 10 if no_bids else 4
-        sell_spread = 10 if no_asks else 4
-        buy_price = math.floor(decimal_fair_price) - buy_spread
-        sell_price = math.ceil(decimal_fair_price) + sell_spread
+    def trade_osmium(self, state, saved):
+        """
+        Fixed-fair mean-reversion for ASH_COATED_OSMIUM.
 
-        ## update market if someone else is better than us
-        if best_ask is not None:
-            sell_price = best_ask - 1
-        if best_bid is not None:
-            buy_price = best_bid + 1
+        Two signals only — no explicit exit logic:
+          BUY  signal: best_ask <= FAIR - ENTRY_STEP  → buy toward +target (closes any short naturally)
+          SELL signal: best_bid >= FAIR + ENTRY_STEP  → sell toward -target (closes any long naturally)
+          Neither: neutral MM while waiting for next signal.
+        """
+        FAIR = 10000        # Hard-coded mean-reversion anchor.
+        ENTRY_STEP = 1      # Enter this many ticks away from FAIR on either side.
+        MIN_TARGET = 15     # Base target inventory once an entry level triggers.
+        STEP_SIZE = 3       # Add this much target inventory per ENTRY_STEP away.
+        MAX_TAKE = 15       # Cross aggressively — close + flip in one tick if possible.
+        PASSIVE_EDGE = 0    # Passive quote distance from FAIR for ladder orders.
 
-        max_buy =  self.limits["ASH_COATED_OSMIUM"] - self.osmium_position - self.osmium_buy_orders # MAXIMUM SIZE OF MARKET ON BUY SIDE
-        max_sell = self.osmium_position + self.limits["ASH_COATED_OSMIUM"] - self.osmium_sell_orders # MAXIMUM SIZE OF MARKET ON SELL SIDE
+        order_book = state.order_depths.get('ASH_COATED_OSMIUM')
+        if order_book is None:
+            return saved
 
-        pos = self.get_product_pos(state, 'ASH_COATED_OSMIUM')
-        # if we are in long, and our best buy price IS the fair price, don't buy more 
-        if not(pos > 0 and float(buy_price) == decimal_fair_price):
-            self.send_buy_order('ASH_COATED_OSMIUM', buy_price, max_buy, msg=f"ASH_COATED_OSMIUM: MARKET MADE Buy {max_buy} @ {buy_price}")
-        
-        # if we are in short, and our best sell price IS the fair price, don't sell more
-        if not(pos < 0 and float(sell_price) == decimal_fair_price):
-            self.send_sell_order('ASH_COATED_OSMIUM', sell_price, -max_sell, msg=f"ASH_COATED_OSMIUM: MARKET MADE Sell {max_sell} @ {sell_price}")
+        sell_orders = order_book.sell_orders
+        buy_orders  = order_book.buy_orders
+
+        pos   = self.get_product_pos(state, 'ASH_COATED_OSMIUM')
+        limit = self.limits['ASH_COATED_OSMIUM']
+
+        best_ask = min(sell_orders.keys()) if sell_orders else None
+        best_bid = max(buy_orders.keys()) if buy_orders else None
+
+        logger.print(f"OSMIUM FIXED FAIR={FAIR} best_bid={best_bid} best_ask={best_ask} pos={pos}")
+
+        if best_ask is not None and best_ask <= FAIR - ENTRY_STEP:
+            # BUY signal: enter long / close short if already short
+            discount = FAIR - best_ask
+            target = min(limit, MIN_TARGET + (discount // ENTRY_STEP) * STEP_SIZE)
+            self._osmium_take_buy_to(sell_orders, pos, target, FAIR - ENTRY_STEP, max_clip=MAX_TAKE)
+            self._osmium_passive_buy_to(buy_orders, sell_orders, pos, target, FAIR,
+                                        edge=PASSIVE_EDGE, max_clip=MAX_TAKE)
+
+        elif best_bid is not None and best_bid >= FAIR + ENTRY_STEP:
+            # SELL signal: enter short / close long if already long
+            premium = best_bid - FAIR
+            target = -min(limit, MIN_TARGET + (premium // ENTRY_STEP) * STEP_SIZE)
+            self._osmium_take_sell_to(buy_orders, pos, target, FAIR + ENTRY_STEP, max_clip=MAX_TAKE)
+            self._osmium_passive_sell_to(buy_orders, sell_orders, pos, target, FAIR,
+                                         edge=PASSIVE_EDGE, max_clip=MAX_TAKE)
+
+        else:
+            # No signal: neutral MM while holding current position
+            self._osmium_market_make(buy_orders, sell_orders, pos, FAIR, quote_size=10)
+
+        return saved
 
 
 
@@ -509,12 +659,17 @@ class Trader:
         for product in state.order_depths:
             self.orders[product] = []
 
-    def run(self, state: TradingState):        
+    def run(self, state: TradingState):
         self.reset_orders(state)
 
-        # call osmium (formerly tomato) trading
-        self.trade_osmium(state)
+        try:
+            saved = json.loads(state.traderData) if state.traderData and state.traderData != "SAMPLE" else {}
+        except Exception:
+            saved = {}
+
+        saved = self.trade_osmium(state, saved)
         self.trade_pepper(state)
 
-        logger.flush(state, self.orders, self.conversions, self.traderData)
-        return self.orders, self.conversions, self.traderData
+        new_trader_data = json.dumps(saved)
+        logger.flush(state, self.orders, self.conversions, new_trader_data)
+        return self.orders, self.conversions, new_trader_data
