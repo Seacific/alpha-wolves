@@ -141,6 +141,8 @@ class Logger:
 logger = Logger()
 
 class Trader:
+    PEPPER_TRAILING_STOP_PCT = 0.05  # liquidate if price falls 5% below peak
+
     # definite init state
     def __init__(self):
 
@@ -171,6 +173,8 @@ class Trader:
         self.pepper_t0 = None  # reference timestamp (ms) used when regression was fit
         self.pepper_prev_bid_wall = None
         self.pepper_prev_ask_wall = None
+        # trailing stop loss state — persisted via traderData
+        self.pepper_trailing_high = None
 
         # squid
 
@@ -370,6 +374,20 @@ class Trader:
         self.pepper_prev_bid_wall = bid_wall_price
         self.pepper_prev_ask_wall = ask_wall_price
 
+        # --- Trailing stop loss ---
+        if self.pepper_position > 0:
+            if self.pepper_trailing_high is None or decimal_fair_price > self.pepper_trailing_high:
+                self.pepper_trailing_high = decimal_fair_price
+            stop_level = self.pepper_trailing_high * (1 - self.PEPPER_TRAILING_STOP_PCT)
+            logger.print(f"PEPPER TRAILING STOP: fair={decimal_fair_price:.2f} high={self.pepper_trailing_high:.2f} stop={stop_level:.2f}")
+            if decimal_fair_price <= stop_level:
+                logger.print(f"PEPPER TRAILING STOP TRIGGERED — liquidating {self.pepper_position} units")
+                self.search_sells(state, 'INTARIAN_PEPPER_ROOT', -999999, depth=10)
+                self.pepper_trailing_high = None
+                return  # skip new buy orders this tick
+        else:
+            self.pepper_trailing_high = None
+
         # predict price using the regression line: intercept + slope * t_rel
         if t0_for_pred is not None and intercept_for_pred is not None:
             t_rel_now = (float(state.timestamp) - t0_for_pred) / 1000.0
@@ -506,6 +524,13 @@ class Trader:
         self.pepper_buy_orders = 0
         self.pepper_sell_orders = 0
 
+        # restore persistent state from last tick
+        try:
+            saved = json.loads(state.traderData)
+            self.pepper_trailing_high = saved.get('pepper_trailing_high', None)
+        except Exception:
+            self.pepper_trailing_high = None
+
         for product in state.order_depths:
             self.orders[product] = []
 
@@ -516,5 +541,6 @@ class Trader:
         self.trade_osmium(state)
         self.trade_pepper(state)
 
+        self.traderData = json.dumps({'pepper_trailing_high': self.pepper_trailing_high})
         logger.flush(state, self.orders, self.conversions, self.traderData)
         return self.orders, self.conversions, self.traderData
