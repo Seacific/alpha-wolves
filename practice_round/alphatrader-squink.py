@@ -10,6 +10,8 @@ from typing import Any
 from datamodel import *
 from datamodel import Listing, Observation, Order, OrderDepth, ProsperityEncoder, Symbol, Trade, TradingState
 
+#Test Edit
+
 class Logger:
     def __init__(self) -> None:
         self.logs = ""
