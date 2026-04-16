@@ -141,6 +141,8 @@ class Logger:
 logger = Logger()
 
 class Trader:
+    PEPPER_TRAILING_STOP_PCT = 0.05  # liquidate if price falls 5% below peak
+
     # definite init state
     def __init__(self):
 
@@ -171,6 +173,10 @@ class Trader:
         self.pepper_t0 = None  # reference timestamp (ms) used when regression was fit
         self.pepper_prev_bid_wall = None
         self.pepper_prev_ask_wall = None
+        # trailing stop loss state — persisted via traderData
+        self.pepper_trailing_high = None
+        # last known OLS p-value (1.0 = not significant / unknown)
+        self.pepper_p_value = 1.0
 
         # squid
 
@@ -288,10 +294,10 @@ class Trader:
 
 
     def trade_pepper(self, state):
-        # Compute regression slope from recent market trades for INTARIAN_PEPPER_ROOT
+        # Compute rolling OLS from recent market trades for INTARIAN_PEPPER_ROOT
         slope = None
+        p_value = 1.0  # default: not significant
         trades = state.market_trades.get('INTARIAN_PEPPER_ROOT', []) if hasattr(state, 'market_trades') else []
-        # extract last up to 1000 trades
         if trades:
             try:
                 arr = sorted(trades, key=lambda t: float(t.timestamp))
@@ -300,29 +306,32 @@ class Trader:
                 ts = np.array([float(t.timestamp) for t in recent], dtype=float)
                 prices = np.array([float(t.price) for t in recent], dtype=float)
                 if len(ts) >= 3:
-                    # use seconds for slope units
                     t0 = ts[0]
                     t_rel = (ts - t0) / 1000.0
                     try:
                         from scipy import stats
                         slope, intercept, r_value, p_value, std_err = stats.linregress(t_rel, prices)
+                        p_value = float(p_value)
                     except Exception:
                         coeffs = np.polyfit(t_rel, prices, 1)
                         slope = float(coeffs[0])
                         intercept = float(coeffs[1])
+                        p_value = 1.0  # polyfit gives no p-value; treat as not significant
                 else:
                     slope = None
             except Exception:
                 slope = None
 
-        # fallback to previously computed regression if available
+        # fallback to previously computed regression if not enough data this tick
         if slope is None:
             slope = self.pepper_slope if self.pepper_slope is not None else 0.0
+            p_value = self.pepper_p_value  # reuse last known p-value
             t0_for_pred = self.pepper_t0
             intercept_for_pred = self.pepper_intercept
         else:
             self.pepper_slope = float(slope)
             self.pepper_intercept = float(intercept)
+            self.pepper_p_value = p_value
             self.pepper_t0 = float(t0)
             t0_for_pred = float(t0)
             intercept_for_pred = float(intercept)
@@ -370,6 +379,20 @@ class Trader:
         self.pepper_prev_bid_wall = bid_wall_price
         self.pepper_prev_ask_wall = ask_wall_price
 
+        # --- Trailing stop loss ---
+        if self.pepper_position > 0:
+            if self.pepper_trailing_high is None or decimal_fair_price > self.pepper_trailing_high:
+                self.pepper_trailing_high = decimal_fair_price
+            stop_level = self.pepper_trailing_high * (1 - self.PEPPER_TRAILING_STOP_PCT)
+            logger.print(f"PEPPER TRAILING STOP: fair={decimal_fair_price:.2f} high={self.pepper_trailing_high:.2f} stop={stop_level:.2f}")
+            if decimal_fair_price <= stop_level:
+                logger.print(f"PEPPER TRAILING STOP TRIGGERED — liquidating {self.pepper_position} units")
+                self.search_sells(state, 'INTARIAN_PEPPER_ROOT', -999999, depth=10)
+                self.pepper_trailing_high = None
+                return  # skip new buy orders this tick
+        else:
+            self.pepper_trailing_high = None
+
         # predict price using the regression line: intercept + slope * t_rel
         if t0_for_pred is not None and intercept_for_pred is not None:
             t_rel_now = (float(state.timestamp) - t0_for_pred) / 1000.0
@@ -378,16 +401,13 @@ class Trader:
             predicted = decimal_fair_price
 
         logger.print(f"INTARIAN_PEPPER_ROOT PREDICTED PRICE: {predicted:.6f}")
-        self.search_buys(state, 'INTARIAN_PEPPER_ROOT', decimal_fair_price-1, depth=5)
-        #self.search_sells(state, 'INTARIAN_PEPPER_ROOT', decimal_fair_price, depth=5)
 
-        # create market around predicted price — widen when that side has no competition
+        # compute quote prices — widen when that side has no competition
         buy_spread = 15 if no_bids else 8
         sell_spread = 15 if no_asks else 8
         buy_price = math.floor(predicted) - buy_spread
         sell_price = math.ceil(predicted) + sell_spread
 
-        # If another maker present, step to their prices
         other_best_ask = self.get_ask(state, 'INTARIAN_PEPPER_ROOT', int(predicted))
         other_best_bid = self.get_bid(state, 'INTARIAN_PEPPER_ROOT', int(predicted))
         if other_best_ask is not None:
@@ -395,14 +415,42 @@ class Trader:
         if other_best_bid is not None:
             buy_price = other_best_bid + 1
 
-        max_buy = self.limits["INTARIAN_PEPPER_ROOT"] - self.pepper_position - self.pepper_buy_orders
+        max_buy  = self.limits["INTARIAN_PEPPER_ROOT"] - self.pepper_position - self.pepper_buy_orders
         max_sell = self.pepper_position + self.limits["INTARIAN_PEPPER_ROOT"] - self.pepper_sell_orders
 
-        # Post our quotes
-        if max_buy > 0:
-            self.send_buy_order('INTARIAN_PEPPER_ROOT', buy_price, max_buy, msg=f"INTARIAN_PEPPER_ROOT: MARKET MADE Buy {max_buy} @ {buy_price} (pred={predicted:.3f})")
-        #if max_sell > 0:
-        #    self.send_sell_order('INTARIAN_PEPPER_ROOT', sell_price, -max_sell, msg=f"INTARIAN_PEPPER_ROOT: MARKET MADE Sell {max_sell} @ {sell_price} (pred={predicted:.3f})")
+        # OLS regime filter
+        significant   = p_value < 0.1
+        trending_down = significant and slope < 0
+        trending_up   = significant and slope > 0
+        mode = "DOWN" if trending_down else ("UP" if trending_up else "MM")
+        logger.print(f"PEPPER OLS: slope={slope:.4f} p={p_value:.4f} mode={mode}")
+
+        if trending_down:
+            # Significant downtrend — dump any longs and go max short
+            if self.pepper_position > 0:
+                self.search_sells(state, 'INTARIAN_PEPPER_ROOT', -999999, depth=10)
+            max_sell = self.pepper_position + self.limits["INTARIAN_PEPPER_ROOT"] - self.pepper_sell_orders
+            if max_sell > 0:
+                self.send_sell_order('INTARIAN_PEPPER_ROOT', sell_price, -max_sell,
+                    msg=f"PEPPER SHORT: Sell {max_sell} @ {sell_price} (p={p_value:.3f} slope={slope:.4f})")
+
+        elif trending_up:
+            # Significant uptrend — buy aggressively, post buys only
+            self.search_buys(state, 'INTARIAN_PEPPER_ROOT', decimal_fair_price - 1, depth=5)
+            if max_buy > 0:
+                self.send_buy_order('INTARIAN_PEPPER_ROOT', buy_price, max_buy,
+                    msg=f"PEPPER LONG: Buy {max_buy} @ {buy_price} (p={p_value:.3f} slope={slope:.4f})")
+
+        else:
+            # No significant trend — neutral market make both sides
+            self.search_buys(state, 'INTARIAN_PEPPER_ROOT', decimal_fair_price - 1, depth=5)
+            self.search_sells(state, 'INTARIAN_PEPPER_ROOT', decimal_fair_price + 1, depth=5)
+            if max_buy > 0:
+                self.send_buy_order('INTARIAN_PEPPER_ROOT', buy_price, max_buy,
+                    msg=f"PEPPER MM: Buy {max_buy} @ {buy_price} (pred={predicted:.3f})")
+            if max_sell > 0:
+                self.send_sell_order('INTARIAN_PEPPER_ROOT', sell_price, -max_sell,
+                    msg=f"PEPPER MM: Sell {max_sell} @ {sell_price} (pred={predicted:.3f})")
 
     def trade_osmium(self, state):
         # ash_coated_osmium market-making (previously trade_tomato)
@@ -506,6 +554,15 @@ class Trader:
         self.pepper_buy_orders = 0
         self.pepper_sell_orders = 0
 
+        # restore persistent state from last tick
+        try:
+            saved = json.loads(state.traderData)
+            self.pepper_trailing_high = saved.get('pepper_trailing_high', None)
+            self.pepper_p_value = saved.get('pepper_p_value', 1.0)
+        except Exception:
+            self.pepper_trailing_high = None
+            self.pepper_p_value = 1.0
+
         for product in state.order_depths:
             self.orders[product] = []
 
@@ -516,5 +573,9 @@ class Trader:
         self.trade_osmium(state)
         self.trade_pepper(state)
 
+        self.traderData = json.dumps({
+            'pepper_trailing_high': self.pepper_trailing_high,
+            'pepper_p_value': self.pepper_p_value,
+        })
         logger.flush(state, self.orders, self.conversions, self.traderData)
         return self.orders, self.conversions, self.traderData
