@@ -69,8 +69,7 @@ class Logger:
 
 logger = Logger()
 
-MM_VOUCHER_STRIKES = [4500, 5000, 5100, 5200, 5300]
-VOUCHER_LIMIT      = 200
+
 TICKS_PER_DAY      = 10_000
 TOTAL_TICKS        = 50_000   # 5 days to expiry from tick 0
 
@@ -105,51 +104,43 @@ def bs_call_fair(S: float, K: int, iv: float, T: float) -> float:
     return S * _norm_cdf(d1) - K * _norm_cdf(d2)
 
 
-class Trader:
-    # VFE wall-fair MR params
-    VFE_ENTRY_STEP   = 2
-    VFE_MIN_TARGET   = 5
-    VFE_STEP_SIZE    = 1
-    VFE_MAX_TAKE     = 30
-    VFE_PASSIVE_EDGE = 0
-    VFE_EMA_ALPHA    = 0.6
-    VFE_SWING_LIMIT  = 200
-    VFE_MM_QUOTE     = 15
+LIQUID_STRIKES = [5000, 5100, 5200, 5300]
 
-    # VEV_4500 params
-    V4500_ENTRY_STEP = 1; V4500_MIN_TARGET = 5; V4500_STEP_SIZE = 1
-    V4500_MAX_TAKE = 30; V4500_PASSIVE_EDGE = 0; V4500_EMA_ALPHA = 0.8
-    V4500_SWING_LIMIT = 200; V4500_MM_QUOTE = 15
-    # VEV_5000 params
-    V5000_ENTRY_STEP = 1; V5000_MIN_TARGET = 5; V5000_STEP_SIZE = 1
-    V5000_MAX_TAKE = 30; V5000_PASSIVE_EDGE = 0; V5000_EMA_ALPHA = 0.8
-    V5000_SWING_LIMIT = 200; V5000_MM_QUOTE = 15
-    # VEV_5100 params
-    V5100_ENTRY_STEP = 1; V5100_MIN_TARGET = 5; V5100_STEP_SIZE = 1
-    V5100_MAX_TAKE = 30; V5100_PASSIVE_EDGE = 0; V5100_EMA_ALPHA = 0.8
-    V5100_SWING_LIMIT = 50; V5100_MM_QUOTE = 15
-    # VEV_5200 params
-    V5200_ENTRY_STEP = 2; V5200_MIN_TARGET = 5; V5200_STEP_SIZE = 1
-    V5200_MAX_TAKE = 30; V5200_PASSIVE_EDGE = 0; V5200_EMA_ALPHA = 0.8
-    V5200_SWING_LIMIT = 200; V5200_MM_QUOTE = 15
-    # VEV_5300 params
-    V5300_ENTRY_STEP = 2; V5300_MIN_TARGET = 5; V5300_STEP_SIZE = 1
-    V5300_MAX_TAKE = 30; V5300_PASSIVE_EDGE = 0; V5300_EMA_ALPHA = 0.8
-    V5300_SWING_LIMIT = 200; V5300_MM_QUOTE = 15
+
+class Trader:
+    # VFE — r3-gamma signal: blended prior + slow EMA anchor
+    VFE_PRIOR        = 5257.0   # in-sample mean; 70% weight
+    VFE_PRIOR_WEIGHT = 0.7
+    VFE_ANCHOR_ALPHA = 0.001    # slow EMA of mid (~700 tick half-life)
+    VFE_ENTRY        = 10       # ticks from fair to trigger first buy
+    VFE_INIT_QTY     = 100      # units to buy on first signal
+    VFE_ADD_STEP     = 10       # additional ticks required to add more
+    VFE_ADD_QTY      = 80       # units per additional ladder rung
+    VFE_LIMIT        = 200
+
+    # Voucher BS-fair params (liquid strikes 5000-5300)
+    VEV_ENTRY        = 1        # ticks from BS fair to trigger first buy
+    VEV_INIT_QTY     = 5        # units on first signal
+    VEV_ADD_STEP     = 3        # additional ticks below last buy to add more
+    VEV_ADD_QTY      = 3        # extra units per rung deeper
+    VEV_LIMIT        = {5000: 200, 5100: 200, 5200: 75, 5300: 50}
+
+    # Hydrogel Pack params — pure MM, wide spread, tight position cap
+    HG_EDGE          = 4     # ticks inside best bid/ask to post
+    HG_QUOTE_SIZE    = 10    # units per side
+    HG_POS_CAP       = 30    # max absolute position before skewing quotes off
 
     DAY_OFFSET = 0  # set to 4 before live submission
 
     def __init__(self):
         self.limits = {
             'HYDROGEL_PACK': 200,
-            'VELVETFRUIT_EXTRACT': 200,
-            **{f'VEV_{s}': VOUCHER_LIMIT for s in MM_VOUCHER_STRIKES},
+            'VELVETFRUIT_EXTRACT': self.VFE_LIMIT,
+            **{f'VEV_{K}': self.VEV_LIMIT[K] for K in LIQUID_STRIKES},
         }
         self.orders: dict[str, list[Order]] = {}
         self.conversions = 0
         self.traderData = "{}"
-        self.prev_walls: dict[str, tuple] = {}
-        # per-product order accounting, reset each tick
         self._buy_sent:  dict[str, int] = {}
         self._sell_sent: dict[str, int] = {}
 
@@ -260,6 +251,14 @@ class Trader:
         if best_bid_out is not None:
             buy_px  = best_bid_out + 1
 
+        # safety: never cross the market
+        best_ask_any = min(sell_orders.keys()) if sell_orders else None
+        best_bid_any = max(buy_orders.keys())  if buy_orders  else None
+        if best_ask_any is not None:
+            buy_px  = min(buy_px,  best_ask_any - 1)
+        if best_bid_any is not None:
+            sell_px = max(sell_px, best_bid_any + 1)
+
         max_buy  = self._buy_cap(product, pos)
         max_sell = self._sell_cap(product, pos)
         if quote_size is not None:
@@ -286,13 +285,22 @@ class Trader:
         bid_wall = max(buy_orders.items(),  key=lambda x: x[1])[0] if buy_orders  else None
         ask_wall = max(sell_orders.items(), key=lambda x: abs(x[1]))[0] if sell_orders else None
 
-        prev_bid, prev_ask = self.prev_walls.get(product, (None, None))
+        prev_key = f'_wall_{product}'
+        prev_bid, prev_ask = saved.get(prev_key, (bid_wall, ask_wall)) or (bid_wall, ask_wall)
         if bid_wall is None: bid_wall = prev_bid
         if ask_wall is None: ask_wall = prev_ask
-        self.prev_walls[product] = (bid_wall, ask_wall)
+        saved[prev_key] = (bid_wall, ask_wall)
 
         if bid_wall is None or ask_wall is None:
             return saved
+
+        # Skip products with negligible price — no edge, MM just donates
+        best_bid = max(buy_orders.keys())  if buy_orders  else None
+        best_ask = min(sell_orders.keys()) if sell_orders else None
+        if best_bid is not None and best_ask is not None:
+            mid_px = (best_bid + best_ask) / 2.0
+            if mid_px < 5:
+                return saved
 
         raw_fair = (bid_wall + ask_wall) / 2.0
         ema_key  = f'ema_{product}'
@@ -304,15 +312,17 @@ class Trader:
         vol = saved.get(vol_key, 0.0)
         vol = 0.1 * abs(raw_fair - prev_fair) + 0.9 * vol
         saved[vol_key] = vol
-        base_vol = 15  # wall-fair moves more than mid; scale alpha only on big moves
-        vol_scale = min(vol / base_vol, 2.0)  # cap at 2x
+        base_vol = 15
+        vol_scale = min(vol / base_vol, 2.0)
         dyn_alpha = min(ema_alpha * (1.0 + vol_scale), 1.0)
 
         ema_fair = dyn_alpha * raw_fair + (1 - dyn_alpha) * ema_fair
         saved[ema_key] = ema_fair
-        fair = ema_fair
 
         pos = state.position.get(product, 0)
+        limit = self.limits[product]
+
+        fair = ema_fair
         self._buy_sent[product]  = 0
         self._sell_sent[product] = 0
 
@@ -339,39 +349,180 @@ class Trader:
                               quote_size=mm_quote_size, take_quotes=False)
 
         else:
+            # no directional signal — unwind inventory toward 0, then market make
+            if pos > 0 and best_bid is not None and best_bid >= fair:
+                qty = min(pos, max_take, self._sell_cap(product, pos))
+                if qty > 0:
+                    self._sell_sent[product] = self._sell_sent.get(product, 0) + qty
+                    self.orders[product].append(Order(product, best_bid, -qty))
+            elif pos < 0 and best_ask is not None and best_ask <= fair:
+                qty = min(-pos, max_take, self._buy_cap(product, pos))
+                if qty > 0:
+                    self._buy_sent[product] = self._buy_sent.get(product, 0) + qty
+                    self.orders[product].append(Order(product, best_ask, qty))
             self._market_make(product, buy_orders, sell_orders, pos, fair)
 
         return saved
 
     def trade_vfe(self, state: TradingState, saved: dict) -> dict:
-        return self._trade_mr(state, 'VELVETFRUIT_EXTRACT', saved,
-            self.VFE_ENTRY_STEP, self.VFE_MIN_TARGET, self.VFE_STEP_SIZE, self.VFE_MAX_TAKE,
-            self.VFE_PASSIVE_EDGE, self.VFE_EMA_ALPHA, self.VFE_SWING_LIMIT, self.VFE_MM_QUOTE)
+        """r3-gamma signal: fair = PRIOR_WEIGHT*PRIOR + (1-PRIOR_WEIGHT)*slow_EMA(mid)."""
+        product = 'VELVETFRUIT_EXTRACT'
+        depth = state.order_depths.get(product)
+        if depth is None:
+            return saved
+        if not depth.buy_orders or not depth.sell_orders:
+            return saved
 
-    def trade_vev4500(self, state, saved):
-        return self._trade_mr(state, 'VEV_4500', saved,
-            self.V4500_ENTRY_STEP, self.V4500_MIN_TARGET, self.V4500_STEP_SIZE, self.V4500_MAX_TAKE,
-            self.V4500_PASSIVE_EDGE, self.V4500_EMA_ALPHA, self.V4500_SWING_LIMIT, self.V4500_MM_QUOTE)
+        best_bid = max(depth.buy_orders)
+        best_ask = min(depth.sell_orders)
+        mid = (best_bid + best_ask) / 2.0
+        pos = state.position.get(product, 0)
 
-    def trade_vev5000(self, state, saved):
-        return self._trade_mr(state, 'VEV_5000', saved,
-            self.V5000_ENTRY_STEP, self.V5000_MIN_TARGET, self.V5000_STEP_SIZE, self.V5000_MAX_TAKE,
-            self.V5000_PASSIVE_EDGE, self.V5000_EMA_ALPHA, self.V5000_SWING_LIMIT, self.V5000_MM_QUOTE)
+        anchor = saved.get('vfe_anchor', mid)
+        anchor = self.VFE_ANCHOR_ALPHA * mid + (1.0 - self.VFE_ANCHOR_ALPHA) * anchor
+        saved['vfe_anchor'] = anchor
 
-    def trade_vev5100(self, state, saved):
-        return self._trade_mr(state, 'VEV_5100', saved,
-            self.V5100_ENTRY_STEP, self.V5100_MIN_TARGET, self.V5100_STEP_SIZE, self.V5100_MAX_TAKE,
-            self.V5100_PASSIVE_EDGE, self.V5100_EMA_ALPHA, self.V5100_SWING_LIMIT, self.V5100_MM_QUOTE)
+        fair = self.VFE_PRIOR_WEIGHT * self.VFE_PRIOR + (1.0 - self.VFE_PRIOR_WEIGHT) * anchor
+        saved['vfe_fair'] = fair  # share with voucher logic
 
-    def trade_vev5200(self, state, saved):
-        return self._trade_mr(state, 'VEV_5200', saved,
-            self.V5200_ENTRY_STEP, self.V5200_MIN_TARGET, self.V5200_STEP_SIZE, self.V5200_MAX_TAKE,
-            self.V5200_PASSIVE_EDGE, self.V5200_EMA_ALPHA, self.V5200_SWING_LIMIT, self.V5200_MM_QUOTE)
+        last_buy_px  = saved.get('vfe_last_buy_px',  None)
+        last_sell_px = saved.get('vfe_last_sell_px', None)
 
-    def trade_vev5300(self, state, saved):
-        return self._trade_mr(state, 'VEV_5300', saved,
-            self.V5300_ENTRY_STEP, self.V5300_MIN_TARGET, self.V5300_STEP_SIZE, self.V5300_MAX_TAKE,
-            self.V5300_PASSIVE_EDGE, self.V5300_EMA_ALPHA, self.V5300_SWING_LIMIT, self.V5300_MM_QUOTE)
+        if best_ask <= fair - self.VFE_ENTRY:
+            # Only buy if we have no position yet, or price is strictly below last buy
+            if pos <= 0 or last_buy_px is None or best_ask < last_buy_px:
+                discount = fair - best_ask
+                rungs = int((discount - self.VFE_ENTRY) // self.VFE_ADD_STEP)
+                target = min(self.VFE_LIMIT, self.VFE_INIT_QTY + rungs * self.VFE_ADD_QTY)
+                qty = min(target - pos, -depth.sell_orders[best_ask])
+                if qty > 0:
+                    self.orders[product].append(Order(product, best_ask, qty))
+                    saved['vfe_last_buy_px'] = best_ask
+
+        if best_bid >= fair + self.VFE_ENTRY:
+            # Only sell if we have no short yet, or price is strictly above last sell
+            if pos >= 0 or last_sell_px is None or best_bid > last_sell_px:
+                premium = best_bid - fair
+                rungs = int((premium - self.VFE_ENTRY) // self.VFE_ADD_STEP)
+                target = -min(self.VFE_LIMIT, self.VFE_INIT_QTY + rungs * self.VFE_ADD_QTY)
+                qty = min(pos + self.VFE_LIMIT, depth.buy_orders[best_bid])
+                qty = min(qty, pos - target)
+                if qty > 0:
+                    self.orders[product].append(Order(product, best_bid, -qty))
+                    saved['vfe_last_sell_px'] = best_bid
+
+        # Reset last price trackers when position is flat
+        if pos == 0:
+            saved.pop('vfe_last_buy_px',  None)
+            saved.pop('vfe_last_sell_px', None)
+
+        return saved
+
+    def trade_vouchers(self, state: TradingState, saved: dict) -> dict:
+        """Trade liquid options (5000-5300) using BS fair with same VFE anchor as S."""
+        day      = saved.get('day', self.DAY_OFFSET)
+        local_t  = state.timestamp // 100
+        global_t = day * TICKS_PER_DAY + local_t
+        T        = max(TOTAL_TICKS - global_t, 1)
+
+        # Use the VFE fair computed this tick as the option underlying
+        S = saved.get('vfe_fair', self.VFE_PRIOR)
+
+        for K in LIQUID_STRIKES:
+            product = f'VEV_{K}'
+            depth   = state.order_depths.get(product)
+            if depth is None or not depth.buy_orders or not depth.sell_orders:
+                continue
+
+            best_bid = max(depth.buy_orders)
+            best_ask = min(depth.sell_orders)
+            mid_px   = (best_bid + best_ask) / 2.0
+            if mid_px < 5:
+                continue
+
+            iv   = max(IV_SLOPE[K] * global_t + IV_INTERCEPT[K], 1e-6)
+            fair = bs_call_fair(S, K, iv, T)
+            pos  = state.position.get(product, 0)
+            limit = self.VEV_LIMIT[K]
+
+            last_buy_px  = saved.get(f'vev_last_buy_{K}',  None)
+            last_sell_px = saved.get(f'vev_last_sell_{K}', None)
+
+            if best_ask <= fair - self.VEV_ENTRY:
+                if pos <= 0 or last_buy_px is None or best_ask < last_buy_px:
+                    rungs = 0 if last_buy_px is None else int((last_buy_px - best_ask) // self.VEV_ADD_STEP)
+                    qty = min(self.VEV_INIT_QTY + rungs * self.VEV_ADD_QTY, limit - pos, -depth.sell_orders[best_ask])
+                    if qty > 0:
+                        self.orders[product].append(Order(product, best_ask, qty))
+                        saved[f'vev_last_buy_{K}'] = best_ask
+
+            if best_bid >= fair + self.VEV_ENTRY:
+                if pos >= 0 or last_sell_px is None or best_bid > last_sell_px:
+                    rungs = 0 if last_sell_px is None else int((best_bid - last_sell_px) // self.VEV_ADD_STEP)
+                    qty = min(self.VEV_INIT_QTY + rungs * self.VEV_ADD_QTY, limit + pos, depth.buy_orders[best_bid])
+                    if qty > 0:
+                        self.orders[product].append(Order(product, best_bid, -qty))
+                        saved[f'vev_last_sell_{K}'] = best_bid
+
+            if pos == 0:
+                saved.pop(f'vev_last_buy_{K}',  None)
+                saved.pop(f'vev_last_sell_{K}', None)
+
+        return saved
+
+    def trade_hydrogel(self, state: TradingState, saved: dict) -> dict:
+        product = 'HYDROGEL_PACK'
+        depth = state.order_depths.get(product)
+        if depth is None:
+            return saved
+
+        buy_orders  = depth.buy_orders
+        sell_orders = depth.sell_orders
+        pos = state.position.get(product, 0)
+
+        best_bid = max(buy_orders.keys()) if buy_orders else None
+        best_ask = min(sell_orders.keys()) if sell_orders else None
+        if best_bid is None or best_ask is None:
+            return saved
+
+        # Track avg entry price for unwind profitability check
+        entry_px = saved.get('hg_entry_px', (best_bid + best_ask) / 2.0)
+        if pos == 0:
+            saved['hg_entry_px'] = (best_bid + best_ask) / 2.0
+
+        # Unwind over cap only if profitable (price moved in our favor)
+        if pos > self.HG_POS_CAP and best_bid > entry_px:
+            unwind = min(pos, buy_orders[best_bid])
+            if unwind > 0:
+                self.orders[product].append(Order(product, best_bid, -unwind))
+                saved['hg_entry_px'] = (best_bid + best_ask) / 2.0
+            return saved
+        if pos < -self.HG_POS_CAP and best_ask < entry_px:
+            unwind = min(-pos, -sell_orders[best_ask])
+            if unwind > 0:
+                self.orders[product].append(Order(product, best_ask, unwind))
+                saved['hg_entry_px'] = (best_bid + best_ask) / 2.0
+            return saved
+
+        # Quote inside the spread with inventory skew to stay near flat
+        inv_skew = -pos * 0.3  # nudge quotes against position
+        buy_px  = math.floor(best_bid - self.HG_EDGE + inv_skew)
+        sell_px = math.ceil(best_ask  + self.HG_EDGE + inv_skew)
+
+        # Safety: never cross the market
+        buy_px  = min(buy_px,  best_bid)
+        sell_px = max(sell_px, best_ask)
+
+        buy_qty  = self.HG_QUOTE_SIZE if pos < self.HG_POS_CAP  else 0
+        sell_qty = self.HG_QUOTE_SIZE if pos > -self.HG_POS_CAP else 0
+
+        if buy_qty > 0:
+            self.orders[product].append(Order(product, buy_px,   buy_qty))
+        if sell_qty > 0:
+            self.orders[product].append(Order(product, sell_px, -sell_qty))
+
+        return saved
+
 
     def run(self, state: TradingState):
         self.orders = {p: [] for p in state.order_depths}
@@ -382,7 +533,6 @@ class Trader:
         except Exception:
             saved = {}
 
-        # track day number; DAY_OFFSET=0 for backtester, =4 for live
         prev_ts = saved.get('prev_ts', state.timestamp)
         if state.timestamp < prev_ts:
             saved['day'] = saved.get('day', self.DAY_OFFSET) + 1
@@ -390,12 +540,9 @@ class Trader:
             saved['day'] = self.DAY_OFFSET
         saved['prev_ts'] = state.timestamp
 
-        saved = self.trade_vfe(state, saved)
-        saved = self.trade_vev4500(state, saved)
-        saved = self.trade_vev5000(state, saved)
-        saved = self.trade_vev5100(state, saved)
-        saved = self.trade_vev5200(state, saved)
-        saved = self.trade_vev5300(state, saved)
+        saved = self.trade_hydrogel(state, saved)
+        saved = self.trade_vfe(state, saved)       # sets saved['vfe_fair']
+        saved = self.trade_vouchers(state, saved)  # uses saved['vfe_fair'] as S
 
         self.traderData = json.dumps(saved)
         logger.flush(state, self.orders, self.conversions, self.traderData)
